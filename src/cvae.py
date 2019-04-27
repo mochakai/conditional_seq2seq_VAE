@@ -170,7 +170,6 @@ def timeSince(since, percent):
     return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
 
 
-
 def trainIters(encoder, decoder, n_iters, print_every=1000, plot_every=100, learning_rate=0.01):
     start = time.time()
     plot_losses = []
@@ -200,13 +199,23 @@ def trainIters(encoder, decoder, n_iters, print_every=1000, plot_every=100, lear
                                          iter, iter / n_iters * 100, print_loss_avg))
 	
 
+def get_training_pairs(input_file):
+    res = []
+    with open(input_file, 'r') as f:
+        for line in f:
+            words = line.split(' ')
+            res.append(words[0])
+            res.append(words[1:-1])
+    print(res)
 
 
 
+if __name__ == "__main__":
+    print(device)
+    get_training_pairs('train.txt')
+    # encoder1 = EncoderRNN(vocab_size, hidden_size).to(device)
+    # decoder1 = DecoderRNN(hidden_size, vocab_size).to(device)
+    # trainIters(encoder1, decoder1, 200, print_every=20)
 
-
-
-
-encoder1 = EncoderRNN(vocab_size, hidden_size).to(device)
-decoder1 = DecoderRNN(hidden_size, vocab_size).to(device)
-trainIters(encoder1, decoder1, 200, print_every=20)
+    sys.stdout.flush()
+    sys.exit()
