@@ -1,13 +1,12 @@
 from __future__ import unicode_literals, print_function, division
-from io import open
-import unicodedata
-import string
-import re
 import random
 import time
 import math
-from os import system
+import os
 import sys
+from argparse import ArgumentParser
+from datetime import datetime
+import json
 
 import numpy as np
 import torch
@@ -174,6 +173,23 @@ def timeSince(since, percent):
     return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
 
 
+def save_checkpoint(encoder, decoder, folder_name, record_dict):
+    torch.save(encoder.state_dict(), os.path.join(folder_name, 'encoder.pkl'))
+    torch.save(decoder.state_dict(), os.path.join(folder_name, 'decoder.pkl'))
+    file_name = os.path.join(folder_name, 'loss_score.json')
+    with open(file_name, 'w') as f:
+        json.dump(record_dict, f)
+
+
+def run_test(encoder, decoder):
+    score = 0
+    test_pairs = get_training_pairs('test.txt', test=True)
+    for test in test_pairs:
+        score += evaluate(tensorsFromPair(test), encoder, decoder, test=True)
+    print('='*70)
+    print('Average BLEU-4:', score / len(test_pairs))
+
+
 def trainIters(encoder, decoder, n_iters, print_every=1000, plot_every=100, learning_rate=0.01):
     start = time.time()
     plot_losses = []
@@ -188,26 +204,40 @@ def trainIters(encoder, decoder, n_iters, print_every=1000, plot_every=100, lear
                       for i in range(n_iters)]
     criterion = nn.CrossEntropyLoss()
 
+    folder_name = datetime.now().strftime("%m-%d_%H-%M") + '_iter_' + str(n_iters)
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name)
+    full_score_count = 0
+    best_score = 5
+    record_dict = {'loss': [], 'score': []}
+
     for iter in range(1, n_iters + 1):
         input_and_cond, target_and_cond = training_pairs[iter - 1]
 
         loss = train(input_and_cond, target_and_cond, encoder, decoder, 
                      encoder_optimizer, decoder_optimizer, criterion)
         print_loss_total += loss
-        plot_loss_total += loss
+        record_dict['loss'].append(loss.item())
+        record_dict['score'].append(evaluate(training_pairs[iter - 1], encoder, decoder, show=False))
 
         if iter % print_every == 0:
             print_loss_avg = print_loss_total / print_every
             print_loss_total = 0
+            print('='*70)
             print('%s (%d %d%%) %.4f' % (timeSince(start, iter / n_iters),
                                          iter, iter / n_iters * 100, print_loss_avg))
-            evaluate(tensorsFromPair(random.choice(pairs)), encoder, decoder)
+            score = evaluate(tensorsFromPair(random.choice(pairs)), encoder, decoder)
+            
+            save_checkpoint(encoder, decoder, folder_name, record_dict)
+            full_score_count = full_score_count+1 if score >= 1 else 0
+            if full_score_count > best_score:
+                best_score = full_score_count
+                new_folder = os.path.join(folder_name, 'score_' + str(full_score_count) + '_iter_' + str(iter))
+                if not os.path.exists(new_folder):
+                    os.makedirs(new_folder)
+                save_checkpoint(encoder, decoder, new_folder, record_dict)
 
-    score = 0
-    test_pairs = get_training_pairs('test.txt', test=True)
-    for test in test_pairs:
-        score += evaluate(tensorsFromPair(test), encoder, decoder, test=True)
-    print('Average BLEU-4:', score / len(test_pairs))
+    run_test(encoder, decoder)
 	
 
 def get_training_pairs(input_file, test=False):
@@ -269,7 +299,7 @@ def compute_bleu(output, reference):
     return sentence_bleu([reference], output,weights=(0.25, 0.25, 0.25, 0.25),smoothing_function=cc.method1)
 
 
-def evaluate(pair, encoder, decoder, test=False):
+def evaluate(pair, encoder, decoder, test=False, show=True):
     input_and_cond, target_and_cond = pair
     with torch.no_grad():
         input_tensor, input_cond = input_and_cond
@@ -284,20 +314,37 @@ def evaluate(pair, encoder, decoder, test=False):
         pred = result_trans(decoder_output.max(dim=1)[1])
         gt = result_trans(target_tensor)
 
-        print('{:>20} -> {:20} ans: {}'.format(result_trans(input_tensor)[0], pred[0], gt[0]))
-        # print('pred:', pred)
-        # print('true:', gt)
-        if not test:
-            print('BLEU-4:', compute_bleu(pred, gt))
+        if show:
+            if not test:
+                print('BLEU-4:', compute_bleu(pred, gt))
+            print('{:>20} -> {:20} ans: {}'.format(result_trans(input_tensor)[0], pred[0], gt[0]))
+            # print('pred:', pred)
+            # print('true:', gt)
 
-        return compute_bleu(pred, gt) # , decoder_attentions[:di + 1]
+        return compute_bleu(pred, gt)
+
+
+def load_checkpoint(encoder, decoder, args):
+    encoder.load_state_dict(torch.load(os.path.join(args.load, 'encoder.pkl')))
+    decoder.load_state_dict(torch.load(os.path.join(args.load, 'decoder.pkl')))
+    run_test(encoder, decoder)
+
+
+def get_args():
+    parser = ArgumentParser()
+    parser.add_argument("-l", "--load", help="folder path where encoder.pkl & decoder.pkl exists", type=str, default='')
+    parser.add_argument("-it", "--iter", help="folder path where encoder.pkl & decoder.pkl exists", type=str, default='')
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-
-    encoder1 = EncoderRNN(VOCAB_SIZE, HIDDEN_SIZE, len(TENSE), COND_EMB_SIZE, LATENT_SIZE).to(device)
-    decoder1 = DecoderRNN(VOCAB_SIZE, HIDDEN_SIZE, len(TENSE), COND_EMB_SIZE, LATENT_SIZE).to(device)
-    trainIters(encoder1, decoder1, 200000, print_every=1000)
+    args = get_args()
+    encoder_init = EncoderRNN(VOCAB_SIZE, HIDDEN_SIZE, len(TENSE), COND_EMB_SIZE, LATENT_SIZE).to(device)
+    decoder_init = DecoderRNN(VOCAB_SIZE, HIDDEN_SIZE, len(TENSE), COND_EMB_SIZE, LATENT_SIZE).to(device)
+    if args.load:
+        load_checkpoint(encoder_init, decoder_init, args)
+    else:
+        trainIters(encoder_init, decoder_init, 200000, print_every=1000)
 
     sys.stdout.flush()
     sys.exit()
