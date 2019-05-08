@@ -48,7 +48,7 @@ LATENT_SIZE = 32
 COND_EMB_SIZE = 8
 #The number of vocabulary
 VOCAB_SIZE = 28
-TEACHER_FORCING_RATIO = 0.5
+TEACHER_FORCING_RATIO = 0.8
 empty_input_ratio = 0.1
 KLD_weight = 0.0
 LR = 0.05
@@ -61,16 +61,14 @@ class EncoderRNN(nn.Module):
     def __init__(self, vocab_size, hidden_size, cond_size, cond_embedding_size, latent_size):
         super(EncoderRNN, self).__init__()
         self.hidden_size = hidden_size
-        self.cond_size = cond_size
         self.cond_embedding_size = cond_embedding_size
-        self.latent_size = latent_size
 
         self.embedding_word = nn.Embedding(vocab_size, hidden_size)
         self.gru = nn.GRU(hidden_size, hidden_size)
 
     def forward(self, input, hidden, count=0):
         embeded = self.embedding_word(input).view(1, 1, -1)
-        outs, h = self.gru(embeded, hidden)              # (word_len, 1, hidden_size), (1, 1, hidden_size)
+        outs, h = self.gru(embeded, hidden)              # (1, 1, hidden_size), (1, 1, hidden_size)
 
         return h, outs
 
@@ -90,13 +88,11 @@ class DecoderRNN(nn.Module):
         self.out = nn.Linear(hidden_size, vocab_size)
 
     def forward(self, input, hidden, teacher_forcing=False):
-        # (word_len, 1, hidden_size)
         embeded = self.embedding_word(input).view(1, 1, -1)
         embeded = F.relu(embeded)
-        # (word_len, 1, hidden_size), (1, 1, hidden_size)
+        # (1, 1, hidden_size), (1, 1, hidden_size)
         outs, h = self.gru(embeded, hidden)
-
-        # (word_len, vocab_size)
+        # (1, vocab_size)
         outputs = self.out(outs).view(-1, self.vocab_size)
         
         return h, outputs
@@ -106,6 +102,7 @@ class CVAE(nn.Module):
     def __init__(self, vocab_size, hidden_size, cond_size, cond_embedding_size, latent_size):
         super(CVAE, self).__init__()
         self.latent_size = latent_size
+        self.kl_weight = KLD_weight
         
         self.encoder = EncoderRNN(vocab_size, hidden_size, cond_size, cond_embedding_size, latent_size)
         self.decoder = DecoderRNN(vocab_size, hidden_size, cond_size, cond_embedding_size, latent_size)
@@ -114,14 +111,9 @@ class CVAE(nn.Module):
         self.mean_linear = nn.Linear(hidden_size, latent_size)
         self.logvar_linear = nn.Linear(hidden_size, latent_size)
 
-    def cal_loss(self, input, gt, mean, log_var, kl_weight=0.002):
-        # reconstruction loss
-        # print(input, gt.unsqueeze(0))
-        # RCL = F.cross_entropy(input, gt.unsqueeze(0))
+    def KLD(self, mean, log_var):
         # kl divergence loss
-        KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
-        return kl_weight * KLD
-        # return RCL + kl_weight * KLD
+        return -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
 
     def forward(self, input_and_cond, target_and_cond, test=False, show=False):
         input_tensor, input_cond = input_and_cond
@@ -181,10 +173,7 @@ class CVAE(nn.Module):
             for i in range(decoder_input.size(0)):
                 hidden, decoder_output = self.decoder(decoder_input[i], hidden)
                 loss += F.cross_entropy(decoder_output, gt[i].unsqueeze(0))
-                # loss += self.cal_loss(decoder_output, gt[i], mean, logvar)
                 loss_count += 1
-                # print('loss:', loss)
-                # print('='*20)
                 pred = decoder_output if pred is None else torch.cat((pred, decoder_output))
             # loss = self.cal_loss(pred, gt, mean, logvar)
             
@@ -194,15 +183,13 @@ class CVAE(nn.Module):
                 hidden, decoder_output = self.decoder(decoder_input, hidden, target_cond)
                 decoder_input = decoder_output.max(dim=1)[1].detach()
                 loss += F.cross_entropy(decoder_output, gt[i].unsqueeze(0))
-                # loss += self.cal_loss(decoder_output, gt[i], mean, logvar)
                 loss_count += 1
-                # print('loss:', loss)
-                # print('='*20)
                 pred = decoder_output if pred is None else torch.cat((pred, decoder_output))
             # loss = self.cal_loss(pred, gt, mean, logvar)
         loss /= loss_count
-        loss += self.cal_loss(pred, gt, mean, logvar)
-        return loss
+        kl_loss = self.KLD(mean, logvar)
+        loss += kl_loss * self.kl_weight
+        return loss, kl_loss
 
 
 def asMinutes(s):
@@ -219,13 +206,13 @@ def timeSince(since, percent):
     return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
 
 
-
 def trainIters(cvae, n_iters, print_every=1000, plot_every=100, learning_rate=0.01):
     start = time.time()
     plot_losses = []
     print_loss_total = 0  # Reset every print_every
+    print_kl_total = 0
     plot_loss_total = 0  # Reset every plot_every
-
+    plot_kl_total = 0
 
     cvae_optimizer = optim.Adam(cvae.parameters())
     pairs = get_training_pairs('train.txt')
@@ -237,41 +224,48 @@ def trainIters(cvae, n_iters, print_every=1000, plot_every=100, learning_rate=0.
         os.makedirs(folder_name)
     full_score_count = 0
     best_score = 0.5
-    record_dict = {'loss': [], 'score': []}
+    record_dict = {'loss': [], 'score': [], 'kl': []}
 
     for iter in range(1, n_iters + 1):
         input_and_cond, target_and_cond = training_pairs[iter - 1]
 
         cvae_optimizer.zero_grad()
-        loss = cvae(input_and_cond, target_and_cond)
+        loss, kl_loss = cvae(input_and_cond, target_and_cond)
         loss.backward()
         cvae_optimizer.step()
 
-        # loss /= (target_and_cond[0].size(0) + 1)
-        print_loss_total += loss
-        record_dict['loss'].append(loss.item())
-        # record_dict['score'].append(evaluate(training_pairs[iter - 1], encoder, decoder, show=False))
-        
+        print_loss_total += loss.item()
+        print_kl_total += kl_loss.item()
+        plot_loss_total += loss.item()
+        plot_kl_total += kl_loss.item()
 
         if iter % print_every == 0:
             print_loss_avg = print_loss_total / print_every
             print_loss_total = 0
+            print_kl_avg = print_kl_total / print_every
+            print_kl_total = 0
             print('='*70)
-            print('%s (%d %d%%) %.4f' % (timeSince(start, iter / n_iters),
-                                         iter, iter / n_iters * 100, print_loss_avg))
+            print('%s (%d %d%%)' % (timeSince(start, iter / n_iters),
+                                         iter, iter / n_iters * 100))
+            print('loss: {:10.4f} kl_loss: {:10.4f}'.format(print_loss_avg, print_kl_avg))
             score = eval(input_and_cond, target_and_cond, cvae, show=True)
-            # score = evaluate(tensorsFromPair(random.choice(pairs)), encoder, decoder)
 
             avg_test_score = run_test(cvae)
             save_checkpoint(cvae, folder_name, record_dict)
             if avg_test_score > best_score:
                 best_score = avg_test_score
-                new_folder = os.path.join(folder_name, 'score_' + int(avg_test_score * 100) + '_iter_' + str(iter))
+                new_folder = os.path.join(folder_name, 'score_' + str(int(avg_test_score * 100)) + '_iter_' + str(iter))
                 if not os.path.exists(new_folder):
                     os.makedirs(new_folder)
-                save_checkpoint(cvae, folder_name, record_dict)
+                save_checkpoint(cvae, new_folder, record_dict)
         
         if iter % plot_every == 0:
+            plot_loss_avg = plot_loss_total / plot_every
+            plot_loss_total = 0
+            plot_kl_avg = plot_kl_total / plot_every
+            plot_kl_total = 0
+            record_dict['loss'].append(plot_loss_avg)
+            record_dict['kl'].append(plot_kl_avg)
             record_dict['score'].append(run_test(cvae, False))
 
 
@@ -358,50 +352,31 @@ def eval(input_and_cond, target_and_cond, cvae, show=False):
     return score
 
 
-def evaluate(pair, encoder, decoder, test=False, show=True):
-    input_and_cond, target_and_cond = pair
-    with torch.no_grad():
-        input_tensor, input_cond = input_and_cond
-        target_tensor, target_cond = target_and_cond
-        sos_tensor = torch.tensor([SOS_token], dtype=torch.long, device=device)
-        eos_tensor = torch.tensor([EOS_token], dtype=torch.long, device=device)
-        
-        for i in range(input_tensor.size(0)):
-            encoder_latent, z_mu, z_var = encoder(input_tensor[i], input_cond, encoder.initHidden())
-        gt = torch.cat((target_tensor, eos_tensor))
-
-        decoder_input = torch.cat((sos_tensor, target_tensor))
-        teacher_pred = None
-        for i in range(decoder_input.size(0)):
-            decoder_output = decoder(decoder_input, encoder_latent, target_cond)
-        teacher_pred = result_trans(decoder_output.max(dim=1)[1])
-
-        total_output = None
-        decoder_input = sos_tensor
-        for _ in range(gt.size(0)):
-        # while decoder_input.item() != eos_tensor.item():
-            decoder_output = decoder(decoder_input, encoder_latent, target_cond)
-            decoder_input = decoder_output.max(dim=1)[1]
-            total_output = decoder_input if total_output is None else torch.cat((total_output, decoder_input))
-            # if decoder_input.item() == eos_tensor.item():
-            #     break
-        pred = result_trans(total_output)
-        gt = result_trans(target_tensor)
-
-        if show:
-            if not test:
-                print('BLEU-4:', compute_bleu(pred, gt))
-            print('{:>20} -> {:20} ans: {}'.format(result_trans(input_tensor)[0], pred[0], gt[0]))
-            print('teacher: ', teacher_pred)
-            # print('pred:', pred)
-            # print('true:', gt)
-
-        return compute_bleu(pred, gt)
-
-
 def load_checkpoint(cvae, args):
     cvae.load_state_dict(torch.load(os.path.join(args.load, 'cvae.pkl')))
     run_test(cvae)
+    
+    eos_tensor = torch.tensor([EOS_token], dtype=torch.long, device=device)
+    decoder_input = torch.tensor([SOS_token], dtype=torch.long, device=device)
+    latent_init = torch.normal(
+        torch.FloatTensor([0]*LATENT_SIZE), 
+        torch.FloatTensor([1]*LATENT_SIZE)
+    ).to(device).view(1,1,-1)
+    
+    for i in range(len(TENSE)):
+        pred = None
+        target_cond = torch.tensor([i], dtype=torch.long, device=device)
+        decoder_c = cvae.embedding_cond(target_cond).view(1,1,-1)
+        lat = torch.cat((latent_init, decoder_c), dim=2)
+        decoder_hidden = cvae.lat2hid(lat)
+        for i in range(20):
+            decoder_hidden, decoder_output = cvae.decoder(decoder_input, decoder_hidden)
+            decoder_input = decoder_output.max(dim=1)[1]
+            pred = decoder_input if pred is None else torch.cat((pred, decoder_input))
+            if decoder_input.item() == eos_tensor.item():
+                break
+        pred = result_trans(pred)
+        print('{}'.format(pred[0]))
 
 
 def get_args():
